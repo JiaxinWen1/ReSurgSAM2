@@ -263,12 +263,10 @@ class SAM2Train(SAM2Base):
         # prepare the text embedding
         flat_text_inputs = [item for sublist in input.expressions for item in sublist]
         text_shape = (len(input.expressions), len(input.expressions[0]))
-        tokenized_input = self.language_tokenizer(flat_text_inputs, padding=True, return_tensors="pt")
-        tokenized_input = {k: v.to(self.device) for k, v in tokenized_input.items()}
-        text_features = self.language_model(**tokenized_input)
-        text_emb_last = text_features.last_hidden_state
+        tokenized_input = self.language_tokenizer(flat_text_inputs).to(self.device)
+        text_emb_last = self.language_model(tokenized_input)
         text_emb_sentence = self.token_projection(text_emb_last)
-        text_emb_cls = self.token_projection(text_features.pooler_output).unsqueeze(1)
+        text_emb_cls = self.token_projection(text_emb_last[:, 0, :]).unsqueeze(1)
         backbone_out["text_emb_inputs"] = {"text_emb_sentence": text_emb_sentence, "text_emb_cls": text_emb_cls}
 
         # the first two frames are init ref frames

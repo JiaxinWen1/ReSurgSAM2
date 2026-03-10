@@ -17,6 +17,7 @@ from sam2.modeling.sam2_utils import get_1d_sine_pe, MLP, select_closest_cond_fr
 from sam2.modeling.cross_modal_fusion import CrossModalFusionModule
 
 from transformers import AutoTokenizer, CLIPModel
+from open_clip import create_model_from_pretrained, get_tokenizer
 from collections import deque
 
 # a large negative value as a placeholder score for missing objects

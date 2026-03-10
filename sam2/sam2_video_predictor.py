@@ -1,4 +1,4 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
+torch# Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 
 # This source code is licensed under the license found in the
@@ -218,12 +218,10 @@ class SAM2VideoPredictor(SAM2Base):
 
         # flat_text_inputs = [item for sublist in input.expressions for item in sublist]
         # text_shape = (len(input.expressions), len(input.expressions[0]))
-        tokenized_input = self.language_tokenizer(text, padding=True, return_tensors="pt")
-        tokenized_input = {k: v.to(self.device) for k, v in tokenized_input.items()}
-        text_features = self.language_model(**tokenized_input)
-        text_emb_last = text_features.last_hidden_state
+        tokenized_input = self.language_tokenizer(text).to(self.device)
+        text_emb_last = self.language_model(tokenized_input)  # 直接返回tensor (B, seq_len, 512)
         text_emb_sentence = self.token_projection(text_emb_last)
-        text_emb_cls = self.token_projection(text_features.pooler_output).unsqueeze(1)
+        text_emb_cls = self.token_projection(text_emb_last[:, 0, :]).unsqueeze(1)  # 用[CLS] token
         text_emb = {"text_emb_sentence": text_emb_sentence, "text_emb_cls": text_emb_cls}
         text_inputs_per_object['text_emb'] = text_emb
 
