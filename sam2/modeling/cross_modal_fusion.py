@@ -70,13 +70,14 @@ class CrossModalFusionModule(nn.Module):
 
     def forward(
         self,
-        image_embeddings: List[torch.Tensor],  # (H*W, B, C)
-        image_pe: List[torch.Tensor],  # (H*W, B, C)
-        text_embeddings: torch.Tensor,  # (B, N, C)
+        image_embeddings: List[torch.Tensor],
+        image_pe: List[torch.Tensor],
+        text_embeddings: torch.Tensor,
         feat_sizes: List[Tuple[int, int]],
         previous_ref_feats_list: List[List],
         previous_ref_pos_embeds_list: List[List],
         return_intermediate=False,
+        text_cls_short: Tensor=None,
     ):
         output_tokens = self.cls_token.weight
         output_tokens = output_tokens.unsqueeze(0).expand(
@@ -132,7 +133,8 @@ class CrossModalFusionModule(nn.Module):
 
         keys_pe = keys_pe + keys_tmp_embed
         # hs (B, N, C), src (B, H*W, C)
-        hs, src = self.transformer(keys, keys_pe, tokens, vol_sizes=(f, h, w))
+        hs, src = self.transformer(keys, keys_pe, tokens, vol_sizes=(f, h, w),
+                                   text_cls_short=text_cls_short)
 
         image_embeddings = src  # (B, H*W, C)
         text_embeddings = hs  # (B, N, C)
@@ -214,6 +216,7 @@ class TwoWayTokenTransformer(nn.Module):
         image_pe: Tensor,
         prompt_embedding: Tensor,
         vol_sizes: Tuple[int, int, int]=None,
+        text_cls_short: Tensor=None,
     ) -> Tuple[Tensor, Tensor]:
         """
         Args:
@@ -241,6 +244,7 @@ class TwoWayTokenTransformer(nn.Module):
                 query_pe=prompt_embedding,
                 key_pe=image_pe,
                 vol_sizes=vol_sizes,
+                text_cls_short=text_cls_short,
             )
 
         # Apply the final attention layer from the points to the image
@@ -301,7 +305,13 @@ class TwoWayTokenAttentionBlock(nn.Module):
             embedding_dim, num_heads, downsample_rate=attention_downsample_rate
         )
 
+        # Spatial-aware prior 模块
+        self.spatial_prior_proj = nn.Conv2d(embedding_dim, embedding_dim, kernel_size=1)
+        self.text_gate_proj = nn.Linear(embedding_dim * 2, embedding_dim)
+        self.spatial_norm = nn.LayerNorm(embedding_dim)
+
         self.skip_first_layer_pe = skip_first_layer_pe
+
         self.use_mamba_before_cross_attn = use_mamba_before_cross_attn
         self.use_dwconv = use_dwconv
         if self.use_mamba_before_cross_attn:
@@ -319,8 +329,10 @@ class TwoWayTokenAttentionBlock(nn.Module):
             print("TwoWayTokenAttentionBlock use_mamba_before_cross_attn")
 
     def forward(
-        self, queries: Tensor, keys: Tensor, query_pe: Tensor, key_pe: Tensor, vol_sizes: Tuple[int, int, int]=None
-    ) -> Tuple[Tensor, Tensor]:  # keys (B, N, C)
+        self, queries: Tensor, keys: Tensor, query_pe: Tensor, key_pe: Tensor,
+        vol_sizes: Tuple[int, int, int]=None,
+        text_cls_short: Tensor=None,
+    ) -> Tuple[Tensor, Tensor]:
         # Self attention block
         if self.skip_first_layer_pe:
             queries = self.self_attn(q=queries, k=queries, v=queries)
@@ -347,8 +359,39 @@ class TwoWayTokenAttentionBlock(nn.Module):
         queries = self.norm3(queries)
 
         # Cross attention block, image embedding attending to tokens
+        # Cross attention block, image embedding attending to tokens
+        # ---- Spatial-aware prior ----
+        B, N_text, C = queries.shape
+
+        # 文本全局特征：优先用短文本 CLS，否则用长文本 CLS + mean
+        if text_cls_short is not None:
+            text_mean = queries.mean(dim=1, keepdim=True)
+            text_global = torch.cat([text_cls_short, text_mean], dim=-1)
+        else:
+            text_cls = queries[:, 0:1, :]
+            text_mean = queries.mean(dim=1, keepdim=True)
+            text_global = torch.cat([text_cls, text_mean], dim=-1)
+        text_gate = self.text_gate_proj(text_global)
+
+        if vol_sizes is not None:
+            f, h, w = vol_sizes
+            cur_keys = keys[:, :h*w, :]
+            cur_keys_2d = cur_keys.permute(0, 2, 1).reshape(B, C, h, w)
+            cur_keys_proj = self.spatial_prior_proj(cur_keys_2d)
+            spatial_prior = torch.sigmoid(
+                (cur_keys_proj * text_gate.permute(0, 2, 1).reshape(B, C, 1, 1)).sum(dim=1, keepdim=True)
+            )
+            cur_keys_enhanced = cur_keys_2d * (1 + spatial_prior)
+            cur_keys_enhanced = cur_keys_enhanced.reshape(B, C, h*w).permute(0, 2, 1)
+            cur_keys_enhanced = self.spatial_norm(cur_keys_enhanced)
+            rest_keys = keys[:, h*w:, :]
+            keys_enhanced = torch.cat([cur_keys_enhanced, rest_keys], dim=1)
+        else:
+            keys_enhanced = keys
+        # ---- Spatial-aware prior 结束 ----
+
         q = queries + query_pe
-        k = keys + key_pe
+        k = keys_enhanced + key_pe
         attn_out = self.cross_attn_image_to_token(q=k, k=q, v=queries)
         keys = keys + attn_out
         keys = self.norm4(keys)

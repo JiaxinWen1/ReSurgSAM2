@@ -17,7 +17,6 @@ from sam2.modeling.sam2_utils import get_1d_sine_pe, MLP, select_closest_cond_fr
 from sam2.modeling.cross_modal_fusion import CrossModalFusionModule
 
 from transformers import AutoTokenizer, CLIPModel
-from open_clip import create_model_from_pretrained, get_tokenizer
 from collections import deque
 
 # a large negative value as a placeholder score for missing objects
@@ -854,7 +853,8 @@ class SAM2Base(torch.nn.Module):
                 text_embeddings=text_emb_inputs["text_emb_sentence"],
                 feat_sizes=feat_sizes,
                 previous_ref_feats_list=previous_ref_feats_list,
-                previous_ref_pos_embeds_list=previous_ref_pos_embeds_list
+                previous_ref_pos_embeds_list=previous_ref_pos_embeds_list,
+                text_cls_short=text_emb_inputs.get("text_emb_cls_short", None),
             )
             # fusion_image_embeddings (H * W, B, C)， fusion_text_embeddings (B, N, C)
 
@@ -876,7 +876,7 @@ class SAM2Base(torch.nn.Module):
                 point_inputs=None,
                 mask_inputs=None,
                 fusion_cls_tokens=text_cls_tokens,
-                text_emb_cls=text_emb_inputs["text_emb_cls"] if self.forward_text_emb else None,
+                text_emb_cls=text_emb_inputs.get("text_emb_cls_short", text_emb_inputs["text_emb_cls"]) if self.forward_text_emb else None,
                 high_res_features=high_res_features,
                 multimask_output=multimask_output,
             )
@@ -915,7 +915,7 @@ class SAM2Base(torch.nn.Module):
                 mask_inputs=mask_inputs,
                 high_res_features=high_res_features,
                 multimask_output=multimask_output,
-                text_emb_cls=text_emb_inputs["text_emb_cls"] if self.forward_text_emb else None,
+                text_emb_cls=text_emb_inputs.get("text_emb_cls_short", text_emb_inputs["text_emb_cls"]) if self.forward_text_emb else None,
             )
 
         return current_out, sam_outputs, high_res_features, pix_feat
