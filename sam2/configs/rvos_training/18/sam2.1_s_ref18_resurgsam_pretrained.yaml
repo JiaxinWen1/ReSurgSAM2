@@ -11,9 +11,9 @@ scratch:
   vision_lr: 5.0e-05
   cross_modal_lr: 3.0e-04
   phases_per_epoch: 1
-  num_epochs: 60
+  num_epochs: 5
   dataset_name: "Ref-Endovis18"
-  pretrained_epoch: 5
+  pretrained_epoch: 1
   num_buffer_frames: 2
   pad_sequence: true
 
