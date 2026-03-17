@@ -224,39 +224,7 @@ class SAM2VideoPredictor(SAM2Base):
         text_emb_last = text_features.last_hidden_state
         text_emb_sentence = self.token_projection(text_emb_last)
         text_emb_cls = self.token_projection(text_features.pooler_output).unsqueeze(1)
-
-        # 新增：编码短文本，提取外观相关特征
-        # 直接内联短文本提取，不依赖外部import
-        import nltk
-        def _extract_short_text(long_text):
-            try:
-                tokens = nltk.word_tokenize(long_text)
-                tagged = nltk.pos_tag(tokens)
-                short_tokens = []
-                for word, tag in tagged:
-                    if tag.startswith('VB'):
-                        break
-                    short_tokens.append(word)
-                result = ' '.join(short_tokens).strip()
-                return result if result else long_text
-            except:
-                return long_text
-
-        short_text = _extract_short_text(text)
-        
-        print(f"[LoSh] long: '{text}' → short: '{short_text}'")
-        tokenized_short = self.language_tokenizer(short_text, padding=True, return_tensors="pt")
-        tokenized_short = {k: v.to(self.device) for k, v in tokenized_short.items()}
-        text_features_short = self.language_model(**tokenized_short)
-        text_emb_cls_short = self.token_projection(
-            text_features_short.pooler_output
-        ).unsqueeze(1)  # [B, 1, C]
-
-        text_emb = {
-            "text_emb_sentence": text_emb_sentence,
-            "text_emb_cls": text_emb_cls,
-            "text_emb_cls_short": text_emb_cls_short,  # 新增
-        }
+        text_emb = {"text_emb_sentence": text_emb_sentence, "text_emb_cls": text_emb_cls}
         text_inputs_per_object['text_emb'] = text_emb
 
         obj_temp_output_dict[storage_key][frame_idx] = None

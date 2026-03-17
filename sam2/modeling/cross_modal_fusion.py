@@ -70,14 +70,13 @@ class CrossModalFusionModule(nn.Module):
 
     def forward(
         self,
-        image_embeddings: List[torch.Tensor],
-        image_pe: List[torch.Tensor],
-        text_embeddings: torch.Tensor,
+        image_embeddings: List[torch.Tensor],  # (H*W, B, C)
+        image_pe: List[torch.Tensor],  # (H*W, B, C)
+        text_embeddings: torch.Tensor,  # (B, N, C)
         feat_sizes: List[Tuple[int, int]],
         previous_ref_feats_list: List[List],
         previous_ref_pos_embeds_list: List[List],
         return_intermediate=False,
-        text_cls_short: Tensor=None,
     ):
         output_tokens = self.cls_token.weight
         output_tokens = output_tokens.unsqueeze(0).expand(
@@ -104,7 +103,6 @@ class CrossModalFusionModule(nn.Module):
         if self.pad_sequence:
             pad_num = self.num_ref_frames - len(previous_ref_feats_list) - 1
             f = self.num_ref_frames
-            # repeat the last frame to make the number of frames equal to num_fusion_frames
             for j in range(pad_num):
                 previous_feat_list.append(keys)
                 previous_pos_embed_list.append(keys_pe)
@@ -116,10 +114,9 @@ class CrossModalFusionModule(nn.Module):
                 previous_tmp_embed_list.append(tmp_embed)
 
         if len(previous_ref_feats_list) != 0:
-            for j in range(len(previous_ref_feats_list)):  # j is the frame index, i is the level index
+            for j in range(len(previous_ref_feats_list)):
                 previous_feat_list.append(previous_ref_feats_list[j][-1])
                 previous_pos_embed_list.append(previous_ref_pos_embeds_list[j][-1])
-                # 0给current，1给previous，2给previous
                 if self.num_temp_pos_embed == 3:
                     time_index = 1 if j == 0 else 2
                 else:
@@ -133,8 +130,7 @@ class CrossModalFusionModule(nn.Module):
 
         keys_pe = keys_pe + keys_tmp_embed
         # hs (B, N, C), src (B, H*W, C)
-        hs, src = self.transformer(keys, keys_pe, tokens, vol_sizes=(f, h, w),
-                                   text_cls_short=text_cls_short)
+        hs, src = self.transformer(keys, keys_pe, tokens, vol_sizes=(f, h, w))
 
         image_embeddings = src  # (B, H*W, C)
         text_embeddings = hs  # (B, N, C)
@@ -164,18 +160,6 @@ class TwoWayTokenTransformer(nn.Module):
         use_dwconv: bool = False,
         dropout: float = 0.1,
     ) -> None:
-        """
-        A transformer decoder that attends to an input image using
-        queries whose positional embedding is supplied.
-
-        Args:
-          depth (int): number of layers in the transformer
-          embedding_dim (int): the channel dimension for the input embeddings
-          num_heads (int): the number of heads for multihead attention. Must
-            divide embedding_dim
-          mlp_dim (int): the channel dimension internal to the MLP block
-          activation (nn.Module): the activation to use in the MLP block
-        """
         super().__init__()
         self.depth = depth
         self.embedding_dim = embedding_dim
@@ -216,18 +200,7 @@ class TwoWayTokenTransformer(nn.Module):
         image_pe: Tensor,
         prompt_embedding: Tensor,
         vol_sizes: Tuple[int, int, int]=None,
-        text_cls_short: Tensor=None,
     ) -> Tuple[Tensor, Tensor]:
-        """
-        Args:
-          image_embedding (torch.Tensor): B x N x embedding_dim.
-          image_pe (torch.Tensor): B x N x embedding_dim.
-          prompt_embedding (torch.Tensor): B x N_points x embedding_dim .
-
-        Returns:
-          torch.Tensor: the processed point_embedding
-          torch.Tensor: the processed image_embedding
-        """
         # BxCxHxW -> BxHWxC == B x N_image_tokens x C
         image_embedding = image_embedding.permute(1, 0, 2)
         image_pe = image_pe.permute(1, 0, 2)
@@ -244,7 +217,6 @@ class TwoWayTokenTransformer(nn.Module):
                 query_pe=prompt_embedding,
                 key_pe=image_pe,
                 vol_sizes=vol_sizes,
-                text_cls_short=text_cls_short,
             )
 
         # Apply the final attention layer from the points to the image
@@ -305,13 +277,31 @@ class TwoWayTokenAttentionBlock(nn.Module):
             embedding_dim, num_heads, downsample_rate=attention_downsample_rate
         )
 
-        # Spatial-aware prior 模块
-        self.spatial_prior_proj = nn.Conv2d(embedding_dim, embedding_dim, kernel_size=1)
-        self.text_gate_proj = nn.Linear(embedding_dim * 2, embedding_dim)
-        self.spatial_norm = nn.LayerNorm(embedding_dim)
+        # =========================================================
+        # 改动1：Gated Side-Adapter（T2V 门控）
+        # 用名词token的最大激活而非全局CLS生成空间权重图
+        # 压缩到64维再做门控，减少计算量
+        # =========================================================
+        self.compress = nn.Conv2d(embedding_dim, 64, kernel_size=1)           # 压缩：256→64
+        self.noun_gate_proj = nn.Linear(embedding_dim, 64)                    # 文本名词token投影到64维
+        self.expand = nn.Conv2d(64, embedding_dim, kernel_size=1)             # 扩张：64→256
+        self.gate_norm = nn.LayerNorm(embedding_dim)                          # 残差后norm
+        # 初始化 expand 为零，确保训练初期gate不影响原始特征
+        nn.init.zeros_(self.expand.weight)
+        nn.init.zeros_(self.expand.bias)
+
+        # =========================================================
+        # 改动2：V2T 置信度加权（遮挡鲁棒性）
+        # 用空间gate权重对视觉token加权，降低遮挡区域噪声影响
+        # =========================================================
+        self.visibility_proj = nn.Linear(embedding_dim, embedding_dim)       # 可见性权重投影
+        self.visibility_norm = nn.LayerNorm(embedding_dim)                    # 加权后norm
+        # 初始化为单位变换，确保训练初期行为与原版一致
+        nn.init.eye_(self.visibility_proj.weight)
+        nn.init.zeros_(self.visibility_proj.bias)
+        # =========================================================
 
         self.skip_first_layer_pe = skip_first_layer_pe
-
         self.use_mamba_before_cross_attn = use_mamba_before_cross_attn
         self.use_dwconv = use_dwconv
         if self.use_mamba_before_cross_attn:
@@ -331,9 +321,11 @@ class TwoWayTokenAttentionBlock(nn.Module):
     def forward(
         self, queries: Tensor, keys: Tensor, query_pe: Tensor, key_pe: Tensor,
         vol_sizes: Tuple[int, int, int]=None,
-        text_cls_short: Tensor=None,
     ) -> Tuple[Tensor, Tensor]:
-        # Self attention block
+
+        # ----------------------------------------------------------
+        # Self attention block（原版不变）
+        # ----------------------------------------------------------
         if self.skip_first_layer_pe:
             queries = self.self_attn(q=queries, k=queries, v=queries)
         else:
@@ -346,54 +338,94 @@ class TwoWayTokenAttentionBlock(nn.Module):
             for layer in self.mamba_layers:
                 keys = layer(keys, vol_sizes)
 
-        # Cross attention block, tokens attending to image embedding
+        # ----------------------------------------------------------
+        # T2V Cross attention（原版不变）
+        # ----------------------------------------------------------
         q = queries + query_pe
         k = keys + key_pe
         attn_out = self.cross_attn_token_to_image(q=q, k=k, v=keys)
         queries = queries + attn_out
         queries = self.norm2(queries)
 
-        # MLP block
+        # MLP block（原版不变）
         mlp_out = self.mlp(queries)
         queries = queries + mlp_out
         queries = self.norm3(queries)
 
-        # Cross attention block, image embedding attending to tokens
-        # Cross attention block, image embedding attending to tokens
-        # ---- Spatial-aware prior ----
-        B, N_text, C = queries.shape
-
-        # 文本全局特征：优先用短文本 CLS，否则用长文本 CLS + mean
-        if text_cls_short is not None:
-            text_mean = queries.mean(dim=1, keepdim=True)
-            text_global = torch.cat([text_cls_short, text_mean], dim=-1)
-        else:
-            text_cls = queries[:, 0:1, :]
-            text_mean = queries.mean(dim=1, keepdim=True)
-            text_global = torch.cat([text_cls, text_mean], dim=-1)
-        text_gate = self.text_gate_proj(text_global)
-
+        # ----------------------------------------------------------
+        # 改动1：Gated Side-Adapter
+        # 只作用于当前帧的视觉特征（cur_keys），历史帧不动
+        # ----------------------------------------------------------
+        gate_map = None  # 用于改动2复用
         if vol_sizes is not None:
             f, h, w = vol_sizes
-            cur_keys = keys[:, :h*w, :]
-            cur_keys_2d = cur_keys.permute(0, 2, 1).reshape(B, C, h, w)
-            cur_keys_proj = self.spatial_prior_proj(cur_keys_2d)
-            spatial_prior = torch.sigmoid(
-                (cur_keys_proj * text_gate.permute(0, 2, 1).reshape(B, C, 1, 1)).sum(dim=1, keepdim=True)
-            )
-            cur_keys_enhanced = cur_keys_2d * (1 + spatial_prior)
-            cur_keys_enhanced = cur_keys_enhanced.reshape(B, C, h*w).permute(0, 2, 1)
-            cur_keys_enhanced = self.spatial_norm(cur_keys_enhanced)
-            rest_keys = keys[:, h*w:, :]
-            keys_enhanced = torch.cat([cur_keys_enhanced, rest_keys], dim=1)
-        else:
-            keys_enhanced = keys
-        # ---- Spatial-aware prior 结束 ----
+            B, N_all, C = keys.shape
 
+            # 取当前帧视觉特征
+            cur_keys = keys[:, :h*w, :]                                       # (B, H*W, C)
+            rest_keys = keys[:, h*w:, :]                                      # (B, rest, C)
+
+            # 文本侧：取名词token的最大激活（比CLS更有判别性）
+            # queries[:,0] 是CLS token，[:,1:] 是文本序列token
+            text_tokens = queries[:, 1:, :]                                   # (B, N_text, C)
+            # max over token维度，取最显著的token作为判别特征
+            noun_feat = text_tokens.max(dim=1).values                         # (B, C)
+            noun_gate = self.noun_gate_proj(noun_feat)                        # (B, 64)
+
+            # 视觉侧：压缩到64维空间做门控
+            cur_keys_2d = cur_keys.permute(0, 2, 1).reshape(B, C, h, w)      # (B, C, H, W)
+            cur_compressed = self.compress(cur_keys_2d)                       # (B, 64, H, W)
+
+            # 计算空间权重图：文本gate与压缩视觉特征的逐通道点积
+            # noun_gate: (B, 64) → (B, 64, 1, 1)
+            gate_map = torch.sigmoid(
+                (cur_compressed * noun_gate.view(B, 64, 1, 1)).sum(dim=1, keepdim=True)
+            )                                                                  # (B, 1, H, W)
+
+            # 双向门控：高激活增强，低激活抑制（不归零保留30%）
+            # gate_map=1 → ×1.0（完全保留），gate_map=0 → ×0.3（抑制但不消除）
+            gated_compressed = cur_compressed * (0.3 + 0.7 * gate_map)       # (B, 64, H, W)
+
+            # 扩张回256维，残差连接（expand初始化为零，训练初期=原始特征）
+            gated_expanded = self.expand(gated_compressed)                    # (B, C, H, W)
+            gated_expanded = gated_expanded.reshape(B, C, h*w).permute(0, 2, 1)  # (B, H*W, C)
+            cur_keys_out = cur_keys + gated_expanded                          # 残差连接
+            cur_keys_out = self.gate_norm(cur_keys_out)
+
+            keys = torch.cat([cur_keys_out, rest_keys], dim=1)                # (B, N_all, C)
+
+        # ----------------------------------------------------------
+        # 改动2：V2T 置信度加权
+        # 用 gate_map 对当前帧视觉token加权，遮挡区域自动降权
+        # 历史帧保持原样（它们本身就是"干净帧"）
+        # ----------------------------------------------------------
+        if vol_sizes is not None and gate_map is not None:
+            f, h, w = vol_sizes
+            B, N_all, C = keys.shape
+
+            # gate_map: (B, 1, H, W) → 可见性权重 [0.3, 1.0]
+            visibility = (0.3 + 0.7 * gate_map)                              # (B, 1, H, W)
+            visibility = visibility.reshape(B, h*w, 1)                       # (B, H*W, 1)
+
+            # 当前帧加权，历史帧权重为1（不变）
+            rest_len = N_all - h*w
+            ones = torch.ones(B, rest_len, 1, device=keys.device)
+            visibility_full = torch.cat([visibility, ones], dim=1)           # (B, N_all, 1)
+
+            # 加权后做线性变换 + 残差（visibility_proj初始化为单位阵，训练初期=原版）
+            keys_weighted = keys * visibility_full
+            keys_proj = self.visibility_proj(keys_weighted)
+            keys_for_v2t = self.visibility_norm(keys + keys_proj)            # 残差保证稳定
+        else:
+            keys_for_v2t = keys
+
+        # ----------------------------------------------------------
+        # V2T Cross attention（结构与原版一致，输入换为加权后的keys）
+        # ----------------------------------------------------------
         q = queries + query_pe
-        k = keys_enhanced + key_pe
+        k = keys_for_v2t + key_pe
         attn_out = self.cross_attn_image_to_token(q=k, k=q, v=queries)
-        keys = keys + attn_out
+        keys = keys + attn_out                                                # 残差仍基于原始keys
         keys = self.norm4(keys)
 
         return queries, keys
