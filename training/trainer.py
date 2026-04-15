@@ -555,9 +555,16 @@ class Trainer:
                     for name, param in model.named_parameters():
                         param.requires_grad = self.original_training_state[name]
                     self.original_training_state = {}
+                    gate_keywords = [
+                        'compress', 'noun_gate_proj', 'expand', 'gate_norm',
+                        'visibility_proj', 'visibility_norm'
+                    ]
+                    # 重新应用门控冻结
+                    for name, param in model.named_parameters():
+                        param.requires_grad = any(k in name for k in gate_keywords)
                     for name, param in model.named_parameters():
                         print(f"{name}: requires_grad = {param.requires_grad}")
-
+                        
             dataloader = self.train_dataset.get_loader(epoch=int(self.epoch))
             barrier()
             outs = self.train_epoch(dataloader)
