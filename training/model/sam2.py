@@ -109,22 +109,7 @@ class SAM2Train(SAM2Base):
             for p in self.image_encoder.parameters():
                 p.requires_grad = False
 
-        for param in self.parameters():
-            param.requires_grad = False
-
-        gate_keywords = [
-            'compress', 'noun_gate_proj', 'expand', 'gate_norm',
-            'visibility_proj', 'visibility_norm'
-        ]
-        for name, param in self.named_parameters():
-            if any(k in name for k in gate_keywords):
-                param.requires_grad = True
-
-        # 验证（训练开始时会打印）
-        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        total = sum(p.numel() for p in self.parameters())
-        logging.info(f"Trainable params: {trainable:,} / {total:,} ({100*trainable/total:.2f}%)")
-
+    
     def forward(self, input: BatchedVideoDatapoint):
         if self.training or not self.forward_backbone_per_frame_for_eval:
             # precompute image features on all frames before tracking
